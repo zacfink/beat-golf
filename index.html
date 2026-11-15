@@ -4,6 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Beat Golf</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<meta name="theme-color" content="#1d3b1f" />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
 <style>
   :root { --bg:#10200f; }
@@ -284,13 +287,14 @@ function update(dt) {
 // =================== input ===================
 const toLogical = e => ({ x: (e.clientX - ox) / sc, y: (e.clientY - oy) / sc });
 const CARDS = THEMES.map((th, i) => ({ x: 20 + (i % 2) * 200, y: 318 + Math.floor(i / 2) * 74, w: 180, h: 62 }));
-const SYNC_BTN = { x: 90, y: 552, w: 240, h: 40 };
+const SYNC_BTN = { x: 90, y: 552, w: 240, h: 40 }, MAKER = { x: 150, y: 628, w: 120, h: 28 };
 const inside = (p, b) => p && p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h;
 let aiming = false;
 function press(p) {
   if (!A) audio();
   if (state === "title") {
     if (inside(p, SYNC_BTN)) { sync = { taps: [] }; state = "sync"; return; }
+    if (inside(p, MAKER)) { window.open("https://zacfinkelstein.ca", "_blank", "noopener"); return; }
     const i = p ? CARDS.findIndex(b => inside(p, b)) : THEMES.indexOf(theme); if (i < 0) return; pickCourse(i); startRound(); return;
   }
   if (state === "sync") {
@@ -476,6 +480,10 @@ function draw() {
     ctx.fillStyle = "rgba(255,255,255,.1)"; ctx.beginPath(); ctx.roundRect(SYNC_BTN.x, SYNC_BTN.y, SYNC_BTN.w, SYNC_BTN.h, 12); ctx.fill();
     txt(`Music feels off? Sync (${calib >= 0 ? "+" : ""}${Math.round(calib * 1000)} ms)`, LW / 2, SYNC_BTN.y + 26, 13, "#c8f7c5", "center", 500);
     txt("[ and ] nudge sync · M mutes", LW / 2, 616, 11, "rgba(255,255,255,.5)", "center", 500);
+    // maker mark: the Z. from zacfinkelstein.ca, tappable
+    ctx.font = `600 14px ${FONT}`; const mw = ctx.measureText("made by Zac").width;
+    txt("made by Zac", LW / 2 - 4, MAKER.y + 19, 14, "rgba(255,255,255,.75)", "center", 600);
+    ctx.fillStyle = "#3a35ff"; circ(LW / 2 - 4 + mw / 2 + 4, MAKER.y + 17, 2.6); ctx.fill();
   }
   if (state === "sync") overlay([["Sync the music", 260, 30, "#ffe066"], ["Tap on every kick drum, in time.", 300, 16, "#fff"], [`${sync.taps.length} / 10`, 360, 40, "#c8f7c5"], [`Current offset ${Math.round(calib * 1000)} ms`, 410, 13, "rgba(255,255,255,.6)", 500]]);
   if (state === "card") {
