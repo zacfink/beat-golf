@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Beat Golf</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+<style>
+  :root { --bg:#10200f; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Beat Golf: aim, then tap when a meter cell lights. The cell you hit on sets the power."></canvas>
+<script>
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const LW = 420, LH = 760, METER_Y = 700, HOLES = 9, FONT = '"Space Grotesk", system-ui, sans-serif';
+let W, H, sc, ox, oy, dpr;
+function resize() { dpr = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight; cv.width = W * dpr; cv.height = H * dpr;
+  sc = Math.min(W / LW, H / LH); ox = (W - LW * sc) / 2; oy = (H - LH * sc) / 2; }
+resize(); addEventListener("resize", resize);
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+// =================== music (its clock is the game clock) ===================
+// One meter cell = one eighth note. The lead arpeggio climbs with the meter and peaks on the "1".
+const BPM = 104, BEAT = 60 / BPM, E = BEAT / 2, BAR = BEAT * 4;
+let A = null, master, echo, t0 = 0, nNote = 0, noiseBuf, muted = false, calib = +(store.get("beatgolf-sync") || 0);
+const midi = m => 440 * 2 ** ((m - 69) / 12), ROOTS = [48, 45, 41, 43], MINOR = [false, true, false, false];
+function audio() {
+  if (A) return; A = new (window.AudioContext || window.webkitAudioContext)();
+  master = A.createGain(); master.gain.value = muted ? 0 : .7; master.connect(A.destination);
+  echo = A.createDelay(); echo.delayTime.value = E * .75;
+  const fb = A.createGain(), wet = A.createGain(); fb.gain.value = .32; wet.gain.value = .45;
+  echo.connect(fb); fb.connect(echo); echo.connect(wet); wet.connect(master);
+  noiseBuf = A.createBuffer(1, A.sampleRate, A.sampleRate); const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  t0 = A.currentTime + .15; nNote = 0; setInterval(sched, 25);
+}
+// What you hear right now: the audio clock minus the output delay (plus the user's sync setting).
+const lat = () => A ? (A.outputLatency || A.baseLatency || 0) + calib : 0;
+const now = () => A ? A.currentTime - lat() : 0;
+function env(node, t, peak, dec, wet) { const g = A.createGain(); g.gain.setValueAtTime(peak, t); g.gain.exponentialRampToValueAtTime(.0001, t + dec); node.connect(g); g.connect(master); if (wet) g.connect(echo); }
+function noise(t, peak, dec, freq = 7000, type = "highpass", q = 1, toFreq) {
+  const s = A.createBufferSource(); s.buffer = noiseBuf; const f = A.createBiquadFilter(); f.type = type; f.frequency.setValueAtTime(freq, t); f.Q.value = q;
+  if (toFreq) f.frequency.exponentialRampToValueAtTime(toFreq, t + dec); s.connect(f); env(f, t, peak, dec); s.start(t, Math.random() * .4); s.stop(t + dec + .02);
+}
+function tone(t, freq, peak, dec, type = "sine", glide, wet, cut) {
+  const o = A.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, t); if (glide) o.frequency.exponentialRampToValueAtTime(glide, t + dec * .6);
+  let src = o; if (cut) { const f = A.createBiquadFilter(); f.type = "lowpass"; f.frequency.value = cut; o.connect(f); src = f; }
+  env(src, t, peak, dec, wet); o.start(t); o.stop(t + dec + .02);
+}
+function sched() {
+  while (t0 + nNote * E < A.currentTime + .12) {
+    const t = t0 + nNote * E, step = nNote % 8, bar = Math.floor(nNote / 8), root = ROOTS[bar % 4], third = MINOR[bar % 4] ? 3 : 4;
+    const cell = step === 0 ? 8 : step, arp = [0, third, 7, 12, 12 + third, 19, 24, 24 + third + (cell === 8 ? 3 : 0)];
+    noise(t, step % 2 ? .03 : .055, step % 2 ? .06 : .03, 8000);
+    if (step === 0 || step === 3 || step === 4) tone(t, 160, step === 3 ? .55 : .95, .22, "sine", 45);
+    if (step === 2 || step === 6) { noise(t, .32, .11, 1800); tone(t, 220, .18, .07, "triangle", 160); }
+    tone(t, midi(root - 12 + (step % 2 ? 12 : 0)), .16, E * .85, "square", null, false, 900);
+    tone(t, midi(root + 12 + arp[cell - 1]), cell === 8 ? .09 : .055, cell === 8 ? .35 : .16, "square", null, true, 3200);
+    if (step === 0) [0, third, 7].forEach(iv => tone(t, midi(root + 12 + iv), .045, .28, "sawtooth", null, true, 2400));
+    nNote++;
+  }
+}
+const chord = () => { const b = Math.max(0, Math.floor((A.currentTime - t0) / BAR)) % 4; return { root: ROOTS[b], third: MINOR[b] ? 3 : 4 }; };
+const sfx = {
+  // A full swing: crack + thump + metal ting + the ball whooshing away. Perfect adds a low boom and a sparkle in key.
+  club(power, perfect) {
+    const t = A.currentTime;
+    noise(t, 1, .02, 3400, "bandpass", 1.4);
+    tone(t, 240, .7, .1, "sine", 70);
+    tone(t, 1870, .05 + power * .007, .55); tone(t, 2790, .035, .4); tone(t, 4110, .02, .25);
+    noise(t + .03, .07 + power * .018, .45 + power * .07, 2400, "bandpass", 2, 380);
+    if (perfect) { const c = chord(); tone(t, 62, .55, .4, "sine", 38); [0, c.third, 7, 12].forEach((iv, i) => tone(t + .04 + i * E / 4, midi(c.root + 36 + iv), .075, .45, "square", null, true, 4200)); }
+  },
+  putt(perfect) { const t = A.currentTime; tone(t, 1450, .24, .045, "triangle"); noise(t, .25, .015, 5200); tone(t, 540, .16, .09);
+    if (perfect) { const c = chord(); tone(t + .03, midi(c.root + 48), .06, .35, "square", null, true, 4200); } },
+  land(ter) { const t = A.currentTime;
+    if (ter === "sand") noise(t, .35, .25, 900, "lowpass");
+    else if (ter === "green") tone(t, 300, .25, .08, "sine", 180);
+    else if (ter === "ice") tone(t, 2400, .06, .3, "sine", 3000);
+    else tone(t, 130, .45, .12, "sine", 60); },
+  cup() { const t = A.currentTime, c = chord(); tone(t, 330, .4, .16, "sine", 150); [.09, .16, .21].forEach((d, i) => tone(t + d, 900 - i * 150, .14, .04, "triangle"));
+    [0, c.third, 7, 12, 12 + c.third, 19].forEach((iv, i) => tone(t + .25 + i * E / 3, midi(c.root + 24 + iv), .12, .5, "square", null, true, 3600)); },
+  hazard(kind) { const t = A.currentTime;
+    if (kind === "lava") { noise(t, .5, .8, 2500); tone(t, 90, .4, .5, "sawtooth", 40, false, 400); }
+    else if (kind === "void" || kind === "canyon") tone(t, 500, .35, .9, "square", 60, true, 1200);
+    else noise(t, .55, .55, 320); },
+  boing() { const t = A.currentTime; tone(t, 380, .25, .25, "square", 900, true, 2500); },
+  bonk() { const t = A.currentTime; tone(t, 180, .35, .1, "triangle", 90); },
+};
+
+// =================== courses ===================
+const THEMES = [
+  { name: "Meadow", seed: 4242, grass: "#3b7a37", fair: "#62b356", edge: "#4f9a45", green: "#86d978", fringe: "#6fc463", sand: "#ead7a0", sandEdge: "#c9b27a",
+    haz: { kind: "water", col: "#2f7fc1", label: "Splash! +1" }, tree: "oak", fw: 86, wind: 7, deco: "flowers", cart: true, rough: 480, flag: "#ff4d4d",
+    names: ["First Light", "Lazy Bend", "Lily Pad", "Mill Stream", "Oak Alley", "The Sandbox", "Shepherd's Crook", "Long Meadow", "Home"] },
+  { name: "Palm Coast", seed: 9137, grass: "#4a8a3a", fair: "#6cc05a", edge: "#5aa64b", green: "#8fe07c", fringe: "#7acb69", sand: "#f3e2b0", sandEdge: "#d6bf85",
+    haz: { kind: "water", col: "#1f9bd6", label: "Splash! +1" }, tree: "palm", fw: 56, wind: 14, deco: "shells", cart: true, ocean: true, rough: 480, flag: "#ff7a45",
+    names: ["Sunrise", "Driftwood", "Lagoon", "Tide Line", "Palm Row", "The Dunes", "Sea Snake", "Boardwalk", "Sunset"] },
+  { name: "Canyon", seed: 777, grass: "#c48a52", fair: "#a7c05a", edge: "#8fa84a", green: "#9fd36a", fringe: "#8cc25c", sand: "#f0d9a0", sandEdge: "#c9a86a",
+    haz: { kind: "canyon", col: "#4a2414", label: "Into the canyon +1" }, tree: "cactus", fw: 66, wind: 22, deco: "rocks", rough: 560, flag: "#2f6fe0",
+    names: ["Dust Off", "Coyote Bend", "Mesa Top", "The Gorge", "Cactus Row", "Dune Sea", "Rattler", "Long Haul", "High Noon"] },
+  { name: "Frost Peaks", seed: 3131, grass: "#e6eef6", fair: "#86b98a", edge: "#a8cdb0", green: "#a2dd9b", fringe: "#8fcd8a", sand: "#e6d9b8", sandEdge: "#c8b88f",
+    haz: { kind: "ice", col: "#bfe6ff", label: "" }, tree: "pine", fw: 72, wind: 10, deco: "snow", rough: 650, flag: "#e63946", snowfall: true,
+    names: ["Fresh Tracks", "Ski Jump", "Frozen Lake", "Crevasse", "Pine Alley", "Snowdrifts", "Switchback", "Avalanche", "Summit"] },
+  { name: "Neon Night", seed: 1984, grass: "#130b2b", fair: "#2a1660", edge: "#ff3cac", green: "#0c4a5a", fringe: "#00e5ff", sand: "#3a2a78", sandEdge: "#8b6cff",
+    haz: { kind: "void", col: "#000000", label: "Lost in the void +1" }, tree: "bumper", fw: 70, wind: 0, deco: "stars", rough: 420, flag: "#ff3cac", glow: true,
+    names: ["Boot Up", "Glitch", "Data Island", "The Void", "Pinball Alley", "Pixel Field", "Snake.exe", "Long Wave", "Game Over"] },
+  { name: "Volcano Isle", seed: 6666, grass: "#2b2726", fair: "#5f8f3a", edge: "#4c7530", green: "#7cc75a", fringe: "#69b24d", sand: "#1d1b1b", sandEdge: "#4a4545",
+    haz: { kind: "lava", col: "#ff5a1f", label: "Lava! +1" }, tree: "rock", fw: 70, wind: 16, deco: "embers", rough: 520, flag: "#ffd23f", embers: true,
+    names: ["Ash Fall", "Obsidian Bend", "Caldera", "Lava Run", "Boulder Row", "Black Sands", "Magma Snake", "Long Fuse", "Eruption"] },
+];
+const ARCH = ["opener", "bend", "island", "crossing", "alley", "bunkers", "snake", "long", "finale"];
+const PAR = { opener: 4, bend: 4, island: 3, crossing: 4, alley: 4, bunkers: 3, snake: 5, long: 5, finale: 4 };
+let theme = THEMES[0];
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const inEll = (e, x, y) => { const c = Math.cos(-e.rot || 0), s = Math.sin(-e.rot || 0), dx = x - e.x, dy = y - e.y, u = dx * c - dy * s, v = dx * s + dy * c; return (u / e.rx) ** 2 + (v / e.ry) ** 2 < 1; };
+
+function makeHole(n) {
+  const R = rng(theme.seed + n * 977), r = (a, b) => a + R() * (b - a);
+  const arch = ARCH[n], par = PAR[arch];
+  const tee = { x: 210 + r(-90, 90), y: 652 };
+  const cup = { x: r(90, 330), y: par === 3 ? r(385, 430) : par === 4 ? r(150, 250) : r(70, 105) };
+  // The fairway is a cubic curve from tee to cup. Bends and snakes push the control points sideways.
+  const side = R() < .5 ? -1 : 1, bend = { opener: 30, bend: 150, snake: 170, long: 80, alley: 25, finale: 90 }[arch] ?? 50;
+  const c1 = { x: tee.x + side * r(bend * .5, bend), y: tee.y + (cup.y - tee.y) * .33 }, c2 = { x: cup.x + (arch === "snake" ? -side : side) * r(bend * .5, bend), y: tee.y + (cup.y - tee.y) * .66 };
+  [c1, c2].forEach(c => c.x = Math.max(50, Math.min(370, c.x)));
+  const path = []; for (let i = 0; i <= 48; i++) { const u = i / 48, a = (1 - u) ** 3, b = 3 * u * (1 - u) ** 2, c = 3 * u * u * (1 - u), d = u ** 3;
+    path.push({ x: a * tee.x + b * c1.x + c * c2.x + d * cup.x, y: a * tee.y + b * c1.y + c * c2.y + d * cup.y }); }
+  const at = u => path[Math.round(u * 48)], perp = u => { const i = Math.round(u * 48), a = path[Math.max(0, i - 1)], b = path[Math.min(48, i + 1)], l = Math.hypot(b.x - a.x, b.y - a.y) || 1; return { x: -(b.y - a.y) / l, y: (b.x - a.x) / l }; };
+  const fw = theme.fw * (arch === "alley" ? .85 : arch === "opener" ? 1.15 : 1);
+  const green = { x: cup.x + r(-14, 14), y: cup.y + r(-14, 14), r: arch === "island" ? r(46, 54) : r(54, 70) };
+  const haz = [], ice = [], sand = [], trees = [], deco = [];
+  const zone = e => (theme.haz.kind === "ice" ? ice : haz).push(e);
+  if (theme.ocean) { const left = n % 2 === 0; haz.push({ x: left ? -125 : LW + 125, y: 380, rx: 165, ry: 640, rot: 0, ocean: true });
+    sand.push({ x: left ? -125 : LW + 125, y: 380, rx: 192, ry: 660, rot: 0, beach: true }); }
+  if (arch === "island" || arch === "finale" && R() < .6) zone({ x: green.x, y: green.y, rx: green.r + r(30, 44), ry: green.r + r(24, 36), rot: r(-.4, .4) });
+  if (arch === "crossing" || arch === "long") { const p = at(r(.38, .55)), q = perp(.45); zone({ x: p.x, y: p.y, rx: 300, ry: r(16, 24), rot: Math.atan2(q.y, q.x) + r(-.15, .15) }); }
+  if (["bend", "snake", "alley", "opener"].includes(arch) && R() < .7) { const u = r(.3, .7), p = at(u), q = perp(u), s = R() < .5 ? -1 : 1, d = fw / 2 + r(30, 55);
+    zone({ x: p.x + q.x * s * d, y: p.y + q.y * s * d, rx: r(38, 70), ry: r(22, 38), rot: r(0, 3.14) }); }
+  const nB = arch === "bunkers" ? 9 : 1 + Math.floor(R() * 3);
+  for (let i = 0; i < nB; i++) { const u = r(.35, .95), p = at(u), q = perp(u), s = R() < .5 ? -1 : 1, d = arch === "bunkers" ? r(-fw / 2, fw / 2 + 40) : fw / 2 + r(4, 26), rr = arch === "bunkers" ? r(10, 18) : r(18, 30);
+    sand.push({ x: p.x + q.x * s * d, y: p.y + q.y * s * d, rx: rr * r(1, 1.4), ry: rr, rot: r(0, 3.14) }); }
+  for (let i = 0, k = arch === "island" ? 0 : 1 + (R() < .5); i < k; i++) { const a = r(0, 6.28), rr = r(15, 22); sand.push({ x: green.x + Math.cos(a) * (green.r + rr * .6), y: green.y + Math.sin(a) * (green.r + rr * .6), rx: rr * 1.3, ry: rr, rot: a }); }
+  const dPath = (x, y) => { let m = 1e9; for (const p of path) { const d = (p.x - x) ** 2 + (p.y - y) ** 2; if (d < m) m = d; } return Math.sqrt(m); };
+  const blocked = (x, y, pad) => Math.hypot(x - green.x, y - green.y) < green.r + pad || [...haz, ...ice].some(e => inEll({ ...e, rx: e.rx + pad, ry: e.ry + pad }, x, y)) || Math.hypot(x - tee.x, y - tee.y) < 30;
+  const tree = (x, y) => trees.push({ x, y, r: theme.tree === "bumper" ? r(9, 13) : r(11, 19), rot: r(0, 6.28), hit: 0 });
+  if (arch === "alley") for (let u = .12; u < .9; u += .075) { const p = at(u), q = perp(u); for (const s of [-1, 1]) { const x = p.x + q.x * s * (fw / 2 + 16), y = p.y + q.y * s * (fw / 2 + 16); if (!blocked(x, y, 10)) tree(x, y); } }
+  for (let i = 0, tries = 0; i < (arch === "alley" ? 4 : 7 + n % 5) && tries < 300; tries++) { const x = r(14, 406), y = r(70, 680);
+    if (dPath(x, y) < fw / 2 + 18 || blocked(x, y, 22)) continue; tree(x, y); i++; }
+  if (theme.tree === "bumper") for (let i = 0; i < (arch === "alley" ? 5 : 2); i++) { const p = at(r(.25, .8)), q = perp(.5), d = r(-fw * .3, fw * .3); if (!blocked(p.x, p.y, 20)) tree(p.x + q.x * d, p.y + q.y * d); }
+  for (let i = 0; i < 70; i++) { const x = r(0, LW), y = r(44, 692); if (dPath(x, y) > fw / 2 + 6 && !blocked(x, y, 4)) deco.push({ x, y, s: r(.6, 1.3), k: Math.floor(R() * 3), ph: r(0, 6.28) }); }
+  const cart = theme.cart ? path.map((p, i) => { const q = perp(i / 48); return { x: p.x + q.x * side * -(fw / 2 + 24), y: p.y + q.y * side * -(fw / 2 + 24) }; }) : null;
+  const wa = r(0, 6.28), wm = arch === "opener" ? 0 : theme.wind * r(.3, 1);
+  const sa = r(0, 6.28), sm = arch === "opener" ? 12 : r(16, 40);
+  return { n, arch, par, name: theme.names[n], tee, cup, path, fw, green, haz, ice, sand, trees, deco, cart, dPath,
+    wind: { x: Math.cos(wa) * wm, y: Math.sin(wa) * wm, m: wm, a: wa }, slope: { x: Math.cos(sa) * sm, y: Math.sin(sa) * sm, a: sa, m: sm } };
+}
+function terrain(h, x, y) {
+  if (x < 4 || x > LW - 4 || y < 44 || y > 692) return "oob";
+  if (Math.hypot(x - h.green.x, y - h.green.y) < h.green.r) return "green";
+  if (h.haz.some(e => inEll(e, x, y))) return "hazard";
+  if (h.ice.some(e => inEll(e, x, y))) return "ice";
+  if (h.sand.some(e => inEll(e, x, y))) return "sand";
+  if (h.dPath(x, y) < h.fw / 2 || Math.hypot(x - h.tee.x, y - h.tee.y) < 22) return "fairway";
+  return "rough";
+}
+const decel = ter => ({ green: 95, fairway: 190, sand: 950, ice: 28 })[ter] ?? theme.rough;
+
+// =================== game state ===================
+let hole, ball, aim, state = "title", strokes = 0, cards = [], last, flight, vel, msg, streak = 0, perfects = 0, hitMark, t = 0;
+let parts = [], trail = [], flash = 0, shake = 0, banner = 0, best = null, sync = null, ambient = [];
+const bestOf = th => { const v = store.get("beatgolf9-" + th.name); return v === null ? null : +v; };
+const fmtPar = v => v === null ? "–" : v === 0 ? "E" : v > 0 ? "+" + v : String(v);
+function pickCourse(i) { theme = THEMES[i]; best = bestOf(theme); ambient = []; }
+function startRound() { cards = []; streak = 0; perfects = 0; loadHole(0); }
+function loadHole(n) { hole = makeHole(n); ball = { x: hole.tee.x, y: hole.tee.y, h: 0 }; strokes = 0; state = "aim"; aimAtCup(); msg = null; banner = 3; trail = []; }
+function aimAtCup() { aim = Math.atan2(hole.cup.y - ball.y, hole.cup.x - ball.x); }
+const yds = px => Math.round(px * .9);
+function club() {
+  const ter = terrain(hole, ball.x, ball.y), d = Math.hypot(hole.cup.x - ball.x, hole.cup.y - ball.y);
+  if (ter === "green") return { name: "Putter", max: 170, putt: true };
+  const c = d > 200 ? { name: "Driver", max: 310 } : d > 112 ? { name: "Iron", max: 215 } : { name: "Wedge", max: 135 };
+  c.max *= ter === "rough" ? .82 : ter === "sand" ? .6 : ter === "ice" ? .9 : 1; return c;
+}
+const phase = () => { const p = ((now() - t0) / BAR) % 1; return p < 0 ? p + 1 : p; };
+// The cell that is sounding right now lights from the moment its note plays, then fades.
+const curCell = () => { const k = Math.floor(phase() * 8); return k === 0 ? 8 : k; };
+const glow = () => 1 - (phase() * 8 % 1);
+const say = (text, col = "#fff", big = false) => { msg = { text, col, big, life: 1.6 }; };
+const burst = (x, y, n, col, sp = 60, up = 0) => { for (let i = 0; i < n; i++) { const a = Math.random() * 6.283, v = Math.random() * sp; parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - up, life: 1, col, r: 1.5 + Math.random() * 2.5 }); } };
+
+function swing() {
+  if (state !== "aim" || !A) return;
+  const pos = (now() - t0) / E, k = Math.round(pos), err = (pos - k) * E, step = ((k % 8) + 8) % 8, power = step === 0 ? 8 : step;
+  const c = club(), dist = c.max * power / 8, ae = Math.abs(err), perfect = ae < .05;
+  let curve = Math.max(-1, Math.min(1, err / .18)) * (c.putt ? .08 : .2), label;
+  if (perfect) { curve = 0; label = "PERFECT"; streak++; perfects++; }
+  else if (ae < .1) { curve *= .4; label = err < 0 ? "Good · a touch early" : "Good · a touch late"; streak = 0; }
+  else { label = err < 0 ? "Early · hooked" : "Late · sliced"; streak = 0; }
+  say(label + (streak > 1 ? `  ×${streak}` : ""), perfect ? "#ffe066" : ae < .1 ? "#c8f7c5" : "#ffb4a2", perfect);
+  c.putt ? sfx.putt(perfect) : sfx.club(power, perfect);
+  hitMark = { power, err, life: 1 };
+  if (perfect) { flash = .55; shake = c.putt ? 2 : 6; burst(ball.x, ball.y, 18, "#ffe066", 140); }
+  else shake = c.putt ? 0 : 3;
+  const ter = terrain(hole, ball.x, ball.y);
+  if (!c.putt) burst(ball.x, ball.y, 10, ter === "sand" ? theme.sand : ter === "rough" ? theme.grass : theme.fair, 90, 40);
+  strokes++; last = { x: ball.x, y: ball.y }; trail = [];
+  const dir = aim + curve, bonus = perfect ? 1.06 : 1;
+  if (c.putt) { vel = { x: Math.cos(dir), y: Math.sin(dir), s: Math.sqrt(2 * 95 * dist * bonus), putt: true }; state = "roll"; return; }
+  // Full shots scatter a little (less on a perfect hit), so aiming at the cup isn't an automatic ace.
+  const spread = perfect ? .5 : .8, d2 = dir + (Math.random() - .5) * .07 * spread, carry = dist * .85 * (1 + (Math.random() - .5) * .14 * spread), dur = .55 + carry / 520;
+  flight = { fx: ball.x, fy: ball.y, tx: ball.x + Math.cos(d2) * carry, ty: ball.y + Math.sin(d2) * carry, u: 0, dur, peak: carry * .14, roll: Math.sqrt(2 * 190 * dist * .15 * bonus), dir: d2 };
+  state = "flight";
+}
+// Max score per hole is par + 5: past that you pick up, so no hole can trap you.
+function maxedOut() { if (strokes < hole.par + 5) return false; strokes = hole.par + 5; state = "sunk"; say("Picked up", "#ffb4a2", true); cards.push({ par: hole.par, strokes }); setTimeout(() => { state = "card"; }, 1200); return true; }
+function penalty(text) {
+  sfx.hazard(theme.haz.kind); burst(ball.x, ball.y, 22, theme.haz.kind === "lava" ? "#ffb347" : theme.haz.kind === "water" ? "#bfe8ff" : "#888", 120, 60);
+  strokes++; ball.x = last.x; ball.y = last.y; ball.h = 0; say(text, "#9fd3ff", true); shake = 5; state = "aim"; aimAtCup(); maxedOut();
+}
+function holed() {
+  state = "sunk"; sfx.cup(); burst(hole.cup.x, hole.cup.y, 30, "#ffe066", 160, 30); flash = .4;
+  const d = strokes - hole.par, NAMES = { "-3": "Albatross!", "-2": "Eagle!", "-1": "Birdie!", "0": "Par", "1": "Bogey", "2": "Double bogey" };
+  say(strokes === 1 ? "Hole in one!" : NAMES[d] || `+${d}`, "#ffe066", true);
+  cards.push({ par: hole.par, strokes });
+  setTimeout(() => { state = "card"; }, 1400);
+}
+function next() {
+  if (hole.n + 1 < HOLES) { loadHole(hole.n + 1); return; }
+  state = "final"; const tot = cards.reduce((a, c) => a + c.strokes - c.par, 0);
+  if (best === null || tot < best) { best = tot; store.set("beatgolf9-" + theme.name, tot); }
+}
+function update(dt) {
+  t += dt; flash = Math.max(0, flash - dt * 2); shake *= .85; banner = Math.max(0, banner - dt);
+  if (msg && (msg.life -= dt / 1.6) <= 0) msg = null;
+  if (hitMark && (hitMark.life -= dt) <= 0) hitMark = null;
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 160 * dt; p.vx *= .97; p.life -= dt * 1.4; }
+  parts = parts.filter(p => p.life > 0);
+  if (theme.snowfall || theme.embers || theme.glow) {
+    if (ambient.length < 50 && Math.random() < .5) ambient.push({ x: Math.random() * LW, y: theme.embers ? 690 : 42, v: 15 + Math.random() * 30, s: 1 + Math.random() * 2, ph: Math.random() * 6 });
+    for (const a of ambient) { a.y += (theme.embers ? -a.v : a.v) * dt; a.x += Math.sin(t + a.ph) * 10 * dt; }
+    ambient = ambient.filter(a => a.y > 30 && a.y < 700);
+  }
+  if (!hole) return;
+  for (const tr of hole.trees) tr.hit = Math.max(0, tr.hit - dt * 3);
+  if (state === "flight") {
+    const f = flight; f.u = Math.min(1, f.u + dt / f.dur);
+    const drift = f.u * f.u * f.dur;
+    ball.x = f.fx + (f.tx - f.fx) * f.u + hole.wind.x * drift; ball.y = f.fy + (f.ty - f.fy) * f.u + hole.wind.y * drift; ball.h = Math.sin(Math.PI * f.u) * f.peak;
+    trail.push({ x: ball.x, y: ball.y - ball.h }); if (trail.length > 18) trail.shift();
+    if (f.u >= 1) {
+      ball.h = 0; const ter = terrain(hole, ball.x, ball.y); sfx.land(ter);
+      if (ter === "hazard") return penalty(theme.haz.label);
+      if (ter === "oob") return penalty("Out of bounds +1");
+      if (Math.hypot(ball.x - hole.cup.x, ball.y - hole.cup.y) < 3.5) return holed();
+      burst(ball.x, ball.y, 6, ter === "sand" ? theme.sand : "rgba(255,255,255,.6)", 50, 20);
+      vel = { x: Math.cos(f.dir), y: Math.sin(f.dir), s: ter === "sand" ? 0 : f.roll * (ter === "rough" ? .4 : ter === "ice" ? 2 : ter === "green" ? .5 : 1) }; state = "roll";
+    }
+  } else if (state === "roll") {
+    const steps = 4;
+    if (trail.length) trail.shift();
+    for (let i = 0; i < steps; i++) {
+      const ter = terrain(hole, ball.x, ball.y);
+      if (ter === "hazard") return penalty(theme.haz.label);
+      if (ter === "oob") return penalty("Out of bounds +1");
+      if (ter === "green") { const vx = vel.x * vel.s + hole.slope.x * dt / steps, vy = vel.y * vel.s + hole.slope.y * dt / steps, sp = Math.hypot(vx, vy) || 1e-6; vel.x = vx / sp; vel.y = vy / sp; vel.s = sp; }
+      ball.x += vel.x * vel.s * dt / steps; ball.y += vel.y * vel.s * dt / steps;
+      vel.s = Math.max(0, vel.s - decel(ter) * dt / steps);
+      const dc = Math.hypot(ball.x - hole.cup.x, ball.y - hole.cup.y);
+      if (vel.putt ? dc < 7 && vel.s < 150 : dc < 5 && vel.s < 30) return holed();
+      if (vel.putt && dc < 11 && vel.s < 70) { ball.x += (hole.cup.x - ball.x) * .05; ball.y += (hole.cup.y - ball.y) * .05; }
+      for (const tr of hole.trees) {
+        const cr = theme.tree === "palm" ? 6 : theme.tree === "bumper" ? tr.r : tr.r * .8, dx = ball.x - tr.x, dy = ball.y - tr.y, d = Math.hypot(dx, dy);
+        if (d < cr + 3) { const nx = dx / d, ny = dy / d, dot = vel.x * nx + vel.y * ny; vel.x -= 2 * dot * nx; vel.y -= 2 * dot * ny; ball.x = tr.x + nx * (cr + 3); ball.y = tr.y + ny * (cr + 3);
+          if (theme.tree === "bumper") { vel.s = Math.min(420, vel.s * 1.15 + 60); tr.hit = 1; sfx.boing(); burst(tr.x, tr.y, 10, "#ff3cac", 90); } else { vel.s *= .5; sfx.bonk(); } }
+      }
+    }
+    if (vel.s < 4) { state = "aim"; aimAtCup(); maxedOut(); }
+  }
+}
+
+// =================== input ===================
+const toLogical = e => ({ x: (e.clientX - ox) / sc, y: (e.clientY - oy) / sc });
+const CARDS = THEMES.map((th, i) => ({ x: 20 + (i % 2) * 200, y: 318 + Math.floor(i / 2) * 74, w: 180, h: 62 }));
+const SYNC_BTN = { x: 90, y: 552, w: 240, h: 40 };
+const inside = (p, b) => p && p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h;
+let aiming = false;
+function press(p) {
+  if (!A) audio();
+  if (state === "title") {
+    if (inside(p, SYNC_BTN)) { sync = { taps: [] }; state = "sync"; return; }
+    const i = p ? CARDS.findIndex(b => inside(p, b)) : THEMES.indexOf(theme); if (i < 0) return; pickCourse(i); startRound(); return;
+  }
+  if (state === "sync") {
+    // Tap along with the kick (every beat). The median lateness becomes the sync offset.
+    const pos = (A.currentTime - lat() - t0) / BEAT; sync.taps.push((pos - Math.round(pos)) * BEAT);
+    if (sync.taps.length >= 10) { const v = sync.taps.slice(2).sort((a, b) => a - b), med = v[Math.floor(v.length / 2)];
+      calib = Math.max(-.3, Math.min(.5, calib + med)); store.set("beatgolf-sync", calib); state = "title"; }
+    return;
+  }
+  if (state === "card") { next(); return; }
+  if (state === "final") { state = "title"; return; }
+  if (p && p.y < METER_Y - 6) { if (state === "aim") { aiming = true; aim = Math.atan2(p.y - ball.y, p.x - ball.x); } return; }
+  swing();
+}
+cv.addEventListener("pointerdown", e => { const p = toLogical(e); if (p.x > LW - 46 && p.y < 40 && state !== "title") { muted = !muted; if (master) master.gain.value = muted ? 0 : .7; return; } press(p); });
+cv.addEventListener("pointermove", e => { if (state !== "aim") return; const p = toLogical(e); if (aiming || e.pointerType === "mouse" && p.y < METER_Y - 6) aim = Math.atan2(p.y - ball.y, p.x - ball.x); });
+addEventListener("pointerup", () => aiming = false);
+addEventListener("keydown", e => {
+  if (state === "title" && e.key >= "1" && e.key <= "6") { if (!A) audio(); pickCourse(+e.key - 1); startRound(); return; }
+  if (e.key === " " || e.key === "Enter") { e.preventDefault(); press(null); }
+  if (state === "aim" && e.key === "ArrowLeft") aim -= .035;
+  if (state === "aim" && e.key === "ArrowRight") aim += .035;
+  if (e.key === "[" || e.key === "]") { calib += e.key === "]" ? .01 : -.01; store.set("beatgolf-sync", calib); say(`Sync ${Math.round(calib * 1000)} ms`); }
+  if (e.key === "m") { muted = !muted; if (master) master.gain.value = muted ? 0 : .7; }
+});
+
+// =================== drawing ===================
+function txt(s, x, y, size, col = "#fff", align = "center", weight = 700) { ctx.font = `${weight} ${size}px ${FONT}`; ctx.textAlign = align; ctx.fillStyle = col; ctx.fillText(s, x, y); }
+const ell = (e, grow = 0) => { ctx.beginPath(); ctx.ellipse(e.x, e.y, e.rx + grow, e.ry + grow, e.rot || 0, 0, 6.29); };
+const circ = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, r, 0, 6.29); };
+function drawHazard(e, pulse) {
+  const k = theme.haz.kind;
+  if (k === "water") {
+    ell(e, 3); ctx.fillStyle = "rgba(255,255,255,.18)"; ctx.fill();
+    ell(e); ctx.fillStyle = theme.haz.col; ctx.fill();
+    ctx.save(); ell(e); ctx.clip(); ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.lineWidth = 2;
+    const n = e.ocean ? 14 : 4;
+    for (let i = 0; i < n; i++) { const y = e.y - e.ry + (i + .5) * (e.ry * 2 / n), x = e.x + Math.sin(t * 1.3 + i) * 18;
+      ctx.beginPath(); ctx.moveTo(x - 30, y); ctx.quadraticCurveTo(x, y - 5 - pulse * 3, x + 30, y); ctx.stroke(); }
+    ctx.restore();
+  } else if (k === "canyon") {
+    ell(e, 4); ctx.fillStyle = "#8a4b2a"; ctx.fill(); ell(e); ctx.fillStyle = theme.haz.col; ctx.fill();
+    ctx.fillStyle = "#2a120a"; ctx.beginPath(); ctx.ellipse(e.x, e.y + 2, e.rx * .7, e.ry * .45, e.rot, 0, 6.29); ctx.fill();
+  } else if (k === "void") {
+    ctx.shadowColor = "#ff3cac"; ctx.shadowBlur = 16; ell(e); ctx.fillStyle = "#000"; ctx.fill(); ctx.shadowBlur = 0;
+    ctx.strokeStyle = "#ff3cac"; ctx.lineWidth = 2; ell(e); ctx.stroke();
+    ctx.save(); ell(e); ctx.clip(); for (let i = 0; i < 18; i++) { const a = i * 2.4, rr = (i * 37) % 100 / 100; ctx.fillStyle = `rgba(255,255,255,${.3 + .5 * Math.abs(Math.sin(t * 2 + i))})`;
+      circ(e.x + Math.cos(a) * e.rx * rr, e.y + Math.sin(a) * e.ry * rr, 1.2); ctx.fill(); } ctx.restore();
+  } else if (k === "lava") {
+    ell(e, 4); ctx.fillStyle = "#1a0a05"; ctx.fill();
+    const g = ctx.createRadialGradient(e.x, e.y, 2, e.x, e.y, Math.max(e.rx, e.ry)); g.addColorStop(0, "#ffd23f"); g.addColorStop(.5, "#ff5a1f"); g.addColorStop(1, "#b3200e");
+    ell(e); ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ell(e); ctx.clip(); for (let i = 0; i < 6; i++) { const ph = (t * .7 + i * .37) % 1; ctx.fillStyle = `rgba(255,230,120,${.6 * (1 - ph)})`;
+      circ(e.x + Math.cos(i * 2.1) * e.rx * .55, e.y + Math.sin(i * 1.7) * e.ry * .5, 2 + ph * 6); ctx.fill(); } ctx.restore();
+  }
+}
+function drawTree(tr, pulse) {
+  const k = theme.tree;
+  ctx.fillStyle = "rgba(0,0,0,.22)"; circ(tr.x + 5, tr.y + 6, tr.r); ctx.fill();
+  if (k === "oak") { ctx.fillStyle = "#1f5a28"; circ(tr.x, tr.y, tr.r * (1 + pulse * .05)); ctx.fill(); ctx.fillStyle = "#2b7334"; circ(tr.x - tr.r * .25, tr.y - tr.r * .3, tr.r * .55); ctx.fill(); }
+  else if (k === "palm") { ctx.save(); ctx.translate(tr.x, tr.y); ctx.rotate(tr.rot + Math.sin(t * 1.5 + tr.x) * .06 + pulse * .04);
+    for (let i = 0; i < 7; i++) { ctx.rotate(6.283 / 7); ctx.fillStyle = i % 2 ? "#2f8a3a" : "#3fa44a"; ctx.beginPath(); ctx.ellipse(tr.r * .55, 0, tr.r * .62, tr.r * .2, 0, 0, 6.29); ctx.fill(); }
+    ctx.fillStyle = "#7a5230"; circ(0, 0, 4.5); ctx.fill(); ctx.restore(); }
+  else if (k === "cactus") { ctx.lineCap = "round"; ctx.strokeStyle = "#3f8f4a"; ctx.lineWidth = tr.r * .55;
+    ctx.beginPath(); ctx.moveTo(tr.x, tr.y + tr.r * .5); ctx.lineTo(tr.x, tr.y - tr.r); ctx.stroke(); ctx.lineWidth = tr.r * .35;
+    ctx.beginPath(); ctx.moveTo(tr.x, tr.y); ctx.lineTo(tr.x - tr.r * .6, tr.y); ctx.lineTo(tr.x - tr.r * .6, tr.y - tr.r * .6); ctx.moveTo(tr.x, tr.y - tr.r * .3); ctx.lineTo(tr.x + tr.r * .6, tr.y - tr.r * .3); ctx.lineTo(tr.x + tr.r * .6, tr.y - tr.r * .9); ctx.stroke();
+    if (pulse > .7) { ctx.fillStyle = "#ff7eb6"; circ(tr.x, tr.y - tr.r - 2, 2.5); ctx.fill(); } }
+  else if (k === "pine") { for (let i = 0; i < 3; i++) { const rr = tr.r * (1 - i * .28); ctx.fillStyle = i % 2 ? "#245a3a" : "#1d4d31";
+      ctx.beginPath(); ctx.moveTo(tr.x, tr.y - rr - i * 3); ctx.lineTo(tr.x + rr, tr.y + rr * .7 - i * 5); ctx.lineTo(tr.x - rr, tr.y + rr * .7 - i * 5); ctx.fill(); }
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.moveTo(tr.x, tr.y - tr.r - 6); ctx.lineTo(tr.x + 5, tr.y - tr.r + 2); ctx.lineTo(tr.x - 5, tr.y - tr.r + 2); ctx.fill(); }
+  else if (k === "bumper") { const g = .5 + pulse * .5 + tr.hit; ctx.shadowColor = "#ff3cac"; ctx.shadowBlur = 10 + 14 * g;
+    ctx.fillStyle = "#24124f"; circ(tr.x, tr.y, tr.r); ctx.fill(); ctx.shadowBlur = 0; ctx.strokeStyle = tr.hit > .1 ? "#fff" : "#ff3cac"; ctx.lineWidth = 3; circ(tr.x, tr.y, tr.r); ctx.stroke();
+    ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = 1.5; circ(tr.x, tr.y, tr.r * .5); ctx.stroke(); }
+  else if (k === "rock") { ctx.fillStyle = "#4a4545"; ctx.beginPath(); for (let i = 0; i < 7; i++) { const a = tr.rot + i * .9, rr = tr.r * (.75 + ((i * 53) % 10) / 40); ctx.lineTo(tr.x + Math.cos(a) * rr, tr.y + Math.sin(a) * rr); } ctx.fill();
+    ctx.fillStyle = "#6a6363"; circ(tr.x - tr.r * .25, tr.y - tr.r * .25, tr.r * .35); ctx.fill(); }
+}
+function drawDeco(d) {
+  const k = theme.deco;
+  if (k === "flowers") { ctx.fillStyle = ["#ff8fab", "#ffe066", "#ffffff"][d.k]; for (let i = 0; i < 5; i++) { circ(d.x + Math.cos(i * 1.26) * 2.6 * d.s, d.y + Math.sin(i * 1.26) * 2.6 * d.s, 1.5 * d.s); ctx.fill(); } ctx.fillStyle = "#c98a00"; circ(d.x, d.y, 1.2 * d.s); ctx.fill(); }
+  else if (k === "shells") { ctx.fillStyle = ["#fff2e0", "#ffc7b8", "#f4e1a8"][d.k]; ctx.beginPath(); ctx.arc(d.x, d.y, 3 * d.s, Math.PI, 0); ctx.fill(); }
+  else if (k === "rocks") { ctx.fillStyle = ["#9a6a43", "#7d5434", "#b07d4f"][d.k]; ctx.beginPath(); ctx.ellipse(d.x, d.y, 4 * d.s, 2.6 * d.s, d.ph, 0, 6.29); ctx.fill(); }
+  else if (k === "snow") { ctx.fillStyle = "rgba(170,195,220,.55)"; ctx.beginPath(); ctx.ellipse(d.x, d.y, 7 * d.s, 3 * d.s, 0, 0, 6.29); ctx.fill(); }
+  else if (k === "stars") { ctx.fillStyle = `rgba(${d.k ? "0,229,255" : "255,255,255"},${.25 + .6 * Math.abs(Math.sin(t * 1.6 + d.ph))})`; circ(d.x, d.y, 1.1 * d.s); ctx.fill(); }
+  else if (k === "embers") { ctx.fillStyle = "#3a3434"; ctx.beginPath(); ctx.ellipse(d.x, d.y, 4 * d.s, 2.5 * d.s, d.ph, 0, 6.29); ctx.fill(); if (d.k === 0) { ctx.fillStyle = `rgba(255,120,40,${.3 + .4 * Math.abs(Math.sin(t + d.ph))})`; circ(d.x, d.y, 1.3); ctx.fill(); } }
+}
+function drawCourse(pulse) {
+  const h = hole;
+  ctx.fillStyle = theme.grass; ctx.fillRect(0, 0, LW, LH);
+  ctx.fillStyle = theme.glow ? "rgba(255,60,172,.03)" : "rgba(255,255,255,.03)"; for (let y = 0; y < LH; y += 36) ctx.fillRect(0, y, LW, 18);
+  if (theme.glow) { ctx.strokeStyle = "rgba(255,60,172,.08)"; ctx.lineWidth = 1; for (let x = 0; x < LW; x += 30) { ctx.beginPath(); ctx.moveTo(x, 40); ctx.lineTo(x, 700); ctx.stroke(); } }
+  h.deco.forEach(drawDeco);
+  for (const s of h.sand.filter(s => s.beach)) { ell(s); ctx.fillStyle = theme.sand; ctx.fill(); }
+  ctx.lineCap = ctx.lineJoin = "round";
+  if (h.cart) { ctx.beginPath(); h.cart.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.lineWidth = 9; ctx.strokeStyle = "rgba(225,215,190,.55)"; ctx.stroke(); }
+  const stroke = (w, col, dash) => { ctx.beginPath(); h.path.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.lineWidth = w; ctx.strokeStyle = col; ctx.setLineDash(dash || []); ctx.stroke(); ctx.setLineDash([]); };
+  if (theme.glow) { ctx.shadowColor = theme.edge; ctx.shadowBlur = 14 + pulse * 10; }
+  stroke(h.fw + 8, theme.edge); ctx.shadowBlur = 0; stroke(h.fw, theme.fair); stroke(h.fw, "rgba(255,255,255,.06)", [22, 22]);
+  for (const s of h.sand.filter(s => !s.beach)) { ell(s, 2); ctx.fillStyle = theme.sandEdge; ctx.fill(); ell(s); ctx.fillStyle = theme.sand; ctx.fill(); }
+  for (const e of h.ice) { ell(e, 3); ctx.fillStyle = "rgba(255,255,255,.7)"; ctx.fill(); ell(e); ctx.fillStyle = "#bfe6ff"; ctx.fill();
+    ctx.save(); ell(e); ctx.clip(); ctx.strokeStyle = "rgba(255,255,255,.8)"; ctx.lineWidth = 2; for (let i = -3; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(e.x + i * 22 - 20, e.y - e.ry); ctx.lineTo(e.x + i * 22 + 20, e.y + e.ry); ctx.stroke(); } ctx.restore(); }
+  for (const e of h.haz) drawHazard(e, pulse);
+  const g = h.green;
+  if (theme.glow) { ctx.shadowColor = theme.fringe; ctx.shadowBlur = 18; }
+  ctx.fillStyle = theme.fringe; circ(g.x, g.y, g.r + 7); ctx.fill(); ctx.shadowBlur = 0;
+  ctx.fillStyle = theme.green; circ(g.x, g.y, g.r); ctx.fill();
+  { const sl = h.slope, n = Math.max(1, Math.round(sl.m / 13)); ctx.save(); ctx.translate(g.x, g.y); ctx.rotate(sl.a); ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 2;
+    for (const yy of [-g.r * .45, 0, g.r * .45]) for (let i = 0; i < n; i++) { const x = -g.r * .35 + i * 9 + ((t * 18) % 9); ctx.beginPath(); ctx.moveTo(x - 4, yy - 5); ctx.lineTo(x + 2, yy); ctx.lineTo(x - 4, yy + 5); ctx.stroke(); }
+    ctx.restore(); }
+  ctx.fillStyle = theme.glow ? "#3a1f7a" : theme.edge; ctx.fillRect(h.tee.x - 22, h.tee.y - 12, 44, 24);
+  for (const s of [-1, 1]) { ctx.fillStyle = s < 0 ? "#fff" : theme.flag; circ(h.tee.x + s * 16, h.tee.y - 8, 3); ctx.fill(); }
+  h.trees.forEach(tr => drawTree(tr, pulse));
+  const c = h.cup; ctx.fillStyle = "#14200f"; circ(c.x, c.y, 6); ctx.fill();
+  ctx.strokeStyle = "#eee"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(c.x, c.y - 34); ctx.stroke();
+  const wave = Math.sin(t * 6) * 2 + pulse * 3 + h.wind.x * .15;
+  ctx.fillStyle = theme.flag; ctx.beginPath(); ctx.moveTo(c.x, c.y - 34); ctx.lineTo(c.x + 18 + wave, c.y - 29); ctx.lineTo(c.x, c.y - 23); ctx.fill();
+}
+function drawAim() {
+  const c = club(), lit = curCell(), gl = glow();
+  ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 2; ctx.setLineDash([4, 6]);
+  ctx.beginPath(); ctx.moveTo(ball.x, ball.y); ctx.lineTo(ball.x + Math.cos(aim) * c.max * (c.putt ? 1 : .85), ball.y + Math.sin(aim) * c.max * (c.putt ? 1 : .85)); ctx.stroke(); ctx.setLineDash([]);
+  for (let k = 1; k <= 8; k++) {
+    const d = c.max * k / 8 * (c.putt ? 1 : .85), x = ball.x + Math.cos(aim) * d, y = ball.y + Math.sin(aim) * d, on = k === lit, base = k % 2 ? 3 : 4.5;
+    ctx.fillStyle = on ? (k === 8 ? `rgba(255,224,102,${.5 + gl * .5})` : `rgba(255,255,255,${.5 + gl * .5})`) : k % 2 ? "rgba(255,255,255,.28)" : "rgba(255,255,255,.5)";
+    circ(x, y, on ? base + 4 * gl : base); ctx.fill();
+  }
+}
+function drawBall() {
+  ctx.fillStyle = "rgba(0,0,0,.28)"; ctx.beginPath(); ctx.ellipse(ball.x + ball.h * .35, ball.y + ball.h * .45, 5, 3.5, 0, 0, 6.29); ctx.fill();
+  trail.forEach((p, i) => { ctx.fillStyle = `rgba(255,255,255,${i / trail.length * .35})`; circ(p.x, p.y, 2 + i / trail.length * 2.5); ctx.fill(); });
+  ctx.fillStyle = "#fff"; circ(ball.x, ball.y - ball.h, 5 + ball.h * .03); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,.18)"; ctx.lineWidth = 1; ctx.stroke();
+}
+function drawMeter() {
+  const y = METER_Y, x0 = 20, w = LW - 40, cw = w / 8, lit = curCell(), gl = glow();
+  ctx.fillStyle = "rgba(10,18,12,.9)"; ctx.fillRect(0, y - 8, LW, LH - y + 8);
+  for (let k = 1; k <= 8; k++) {
+    const x = x0 + (k - 1) * cw, beat = k % 2 === 0, on = lit === k;
+    ctx.fillStyle = beat ? "rgba(255,255,255,.16)" : "rgba(255,255,255,.07)"; ctx.beginPath(); ctx.roundRect(x + 3, y + 6, cw - 6, 26, 7); ctx.fill();
+    if (on) { ctx.fillStyle = k === 8 ? `rgba(255,224,102,${.35 + gl * .65})` : `rgba(255,255,255,${.3 + gl * .7})`; ctx.beginPath(); ctx.roundRect(x + 3, y + 6, cw - 6, 26, 7); ctx.fill(); }
+    if (beat) txt(k === 8 ? "1" : String(k / 2 + 1), x + cw / 2, y + 24, 13, on && gl > .4 ? "#14200f" : "rgba(255,255,255,.6)");
+  }
+  // Playhead: reaches a cell's left edge exactly when that cell's note plays.
+  const q = ((phase() * 8 - 1) % 8 + 8) % 8; ctx.fillStyle = "#ffe066"; ctx.fillRect(x0 + q * cw + 1.5, y + 2, 3, 34);
+  if (hitMark) { const x = x0 + (hitMark.power - 1) * cw + 3 + (hitMark.err / E) * cw; ctx.globalAlpha = hitMark.life; ctx.fillStyle = "#ff8a5b";
+    ctx.beginPath(); ctx.moveTo(x, y + 38); ctx.lineTo(x - 6, y + 46); ctx.lineTo(x + 6, y + 46); ctx.fill(); ctx.globalAlpha = 1; }
+  if (state === "aim") { const c = club(); txt(`${c.name} · ${yds(c.max)} yds max · ${yds(Math.hypot(hole.cup.x - ball.x, hole.cup.y - ball.y))} to the pin · dots show where it lands`, LW / 2, y + 52, 11, "rgba(255,255,255,.72)", "center", 500); }
+}
+function hud() {
+  ctx.fillStyle = "rgba(10,18,12,.72)"; ctx.fillRect(0, 0, LW, 40);
+  const tot = cards.reduce((a, c) => a + c.strokes - c.par, 0);
+  txt(`${hole.n + 1}/${HOLES}`, 12, 26, 15, "#fff", "left"); txt(`Par ${hole.par} · Stroke ${strokes}`, LW / 2 - 20, 26, 15, "rgba(255,255,255,.85)");
+  txt(fmtPar(tot), LW - 58, 26, 15, "#ffe066", "right"); txt(muted ? "🔇" : "🔊", LW - 24, 26, 15);
+  if (hole.wind.m > 1) { const x = LW / 2 + 82, y = 21; ctx.save(); ctx.translate(x, y); ctx.rotate(hole.wind.a); ctx.strokeStyle = "#bfe8ff"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-8, 0); ctx.lineTo(8, 0); ctx.lineTo(3, -4); ctx.moveTo(8, 0); ctx.lineTo(3, 4); ctx.stroke(); ctx.restore(); txt(`${Math.round(hole.wind.m)}`, x + 13, 26, 12, "#bfe8ff", "left"); }
+}
+function overlay(lines, a = .8) { ctx.fillStyle = `rgba(8,14,10,${a})`; ctx.fillRect(0, 0, LW, LH); lines.forEach(([s, y, size, col, w]) => txt(s, LW / 2, y, size, col, "center", w || 700)); }
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = "#10200f"; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(dpr * sc, 0, 0, dpr * sc, dpr * ox, dpr * oy);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, LW, LH); ctx.clip();
+  if (!hole) { pickCourse(0); hole = makeHole(0); ball = { x: hole.tee.x, y: hole.tee.y, h: 0 }; aimAtCup(); }
+  const pulse = A ? Math.max(0, 1 - ((((now() - t0) / BEAT) % 1) + 1) % 1 * 4) : 0;
+  ctx.save(); if (shake > .2) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+  drawCourse(pulse);
+  if (state === "aim") drawAim();
+  if (state !== "sunk" && state !== "card") drawBall();
+  for (const p of parts) { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; circ(p.x, p.y, p.r); ctx.fill(); } ctx.globalAlpha = 1;
+  for (const a of ambient) { ctx.fillStyle = theme.embers ? "rgba(255,140,60,.8)" : theme.glow ? "rgba(0,229,255,.5)" : "rgba(255,255,255,.85)"; circ(a.x, a.y, a.s); ctx.fill(); }
+  ctx.restore();
+  if (flash > 0) { ctx.fillStyle = `rgba(255,250,220,${flash * .5})`; ctx.fillRect(0, 0, LW, LH); }
+  if (msg) { ctx.globalAlpha = Math.min(1, msg.life * 2); txt(msg.text, LW / 2, 300, msg.big ? 32 : 20, msg.col); ctx.globalAlpha = 1; }
+  if (banner > 0 && state === "aim") { ctx.globalAlpha = Math.min(1, banner); ctx.fillStyle = "rgba(8,14,10,.65)"; ctx.beginPath(); ctx.roundRect(60, 58, 300, 70, 16); ctx.fill();
+    txt(hole.name, LW / 2, 92, 24, "#fff"); txt(`Hole ${hole.n + 1} · Par ${hole.par} · ${yds(Math.hypot(hole.cup.x - hole.tee.x, hole.cup.y - hole.tee.y))} yds${hole.wind.m > 1 ? ` · wind ${Math.round(hole.wind.m)}` : ""}`, LW / 2, 114, 12, "rgba(255,255,255,.75)", "center", 500); ctx.globalAlpha = 1; }
+  hud(); drawMeter();
+  if (state === "title") {
+    overlay([["BEAT GOLF", 150, 54, "#ffe066"], ["Aim, then tap when a cell lights.", 200, 16, "#fff"], ["The cell you hit sets the power. The 1 is a full swing.", 224, 14, "rgba(255,255,255,.85)", 500],
+      ["Off the beat curves the ball. Watch the wind and the green.", 246, 14, "rgba(255,255,255,.85)", 500], ["Pick a course · 9 holes", 298, 14, "rgba(255,255,255,.6)", 500]], .86);
+    CARDS.forEach((b, i) => { const th = THEMES[i], g = ctx.createLinearGradient(b.x, 0, b.x + b.w, 0); g.addColorStop(0, th.grass); g.addColorStop(1, th.fair);
+      ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 14); ctx.fill(); ctx.strokeStyle = th === theme ? "#ffe066" : "rgba(255,255,255,.25)"; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.beginPath(); ctx.roundRect(b.x, b.y + b.h - 22, b.w, 22, [0, 0, 14, 14]); ctx.fill();
+      txt(`${i + 1}  ${th.name}`, b.x + 12, b.y + 26, 17, "#fff", "left"); txt(`best ${fmtPar(bestOf(th))}`, b.x + 12, b.y + b.h - 7, 11, "rgba(255,255,255,.85)", "left", 500);
+      ctx.fillStyle = th.haz.col; circ(b.x + b.w - 18, b.y + 20, 7); ctx.fill(); });
+    ctx.fillStyle = "rgba(255,255,255,.1)"; ctx.beginPath(); ctx.roundRect(SYNC_BTN.x, SYNC_BTN.y, SYNC_BTN.w, SYNC_BTN.h, 12); ctx.fill();
+    txt(`Music feels off? Sync (${calib >= 0 ? "+" : ""}${Math.round(calib * 1000)} ms)`, LW / 2, SYNC_BTN.y + 26, 13, "#c8f7c5", "center", 500);
+    txt("[ and ] nudge sync · M mutes", LW / 2, 616, 11, "rgba(255,255,255,.5)", "center", 500);
+  }
+  if (state === "sync") overlay([["Sync the music", 260, 30, "#ffe066"], ["Tap on every kick drum, in time.", 300, 16, "#fff"], [`${sync.taps.length} / 10`, 360, 40, "#c8f7c5"], [`Current offset ${Math.round(calib * 1000)} ms`, 410, 13, "rgba(255,255,255,.6)", 500]]);
+  if (state === "card") {
+    const c = cards[cards.length - 1], tot = cards.reduce((a, k) => a + k.strokes - k.par, 0);
+    overlay([[`Hole ${hole.n + 1} · ${hole.name}`, 250, 18, "rgba(255,255,255,.7)"], [`${c.strokes} on a par ${c.par}`, 300, 34, "#fff"],
+      [`Round ${fmtPar(tot)}  ·  ${perfects} perfect hits`, 345, 16, "#ffe066"], [hole.n + 1 < HOLES ? "Tap for the next hole" : "Tap for your scorecard", 420, 20, "#c8f7c5"]]);
+  }
+  if (state === "final") {
+    const tot = cards.reduce((a, k) => a + k.strokes - k.par, 0);
+    overlay([[`${theme.name} · round done`, 220, 20, "rgba(255,255,255,.7)"], [fmtPar(tot), 300, 72, "#ffe066"], [`${cards.reduce((a, k) => a + k.strokes, 0)} strokes · ${perfects} perfect hits`, 350, 16, "#fff"],
+      [cards.map(k => k.strokes).join("  "), 388, 18, "rgba(255,255,255,.85)"], [`Best ${fmtPar(best)}`, 422, 16, "rgba(255,255,255,.65)"], ["Tap for the menu", 490, 22, "#c8f7c5"]]);
+  }
+  ctx.restore();
+}
+let prev = performance.now();
+(function loop(ts) { const dt = Math.min(.05, (ts - prev) / 1000); prev = ts; update(dt); draw(); requestAnimationFrame(loop); })(prev);
+</script>
+</body>
+</html>
